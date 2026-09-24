@@ -465,6 +465,15 @@ impl EditorView {
         if self.composing.get() {
             return None;
         }
+        // The browser's own current caret (a plain collapsed one only),
+        // read ONCE up front — used below to disambiguate `find_diff`'s
+        // otherwise-ambiguous prefix/suffix matching. See `find_diff_
+        // anchored`'s own doc comment for the confirmed-live bug this
+        // fixes.
+        let caret = match self.read_selection() {
+            Some(Selection::Text { anchor, head }) if anchor == head => Some(anchor),
+            _ => None,
+        };
         let mut found = None;
         collect_text_changes(&self.children, 0, &mut |desc, doc_pos| {
             if found.is_some() {
@@ -474,7 +483,12 @@ impl EditorView {
                 let dom_data = text.data();
                 let doc_text = node.text().unwrap_or("");
                 if dom_data != doc_text {
-                    if let Some((offset, old_len, new_part)) = find_diff(doc_text, &dom_data) {
+                    let local_caret = caret
+                        .filter(|&c| c >= doc_pos && c <= doc_pos + dom_data.chars().count())
+                        .map(|c| c - doc_pos);
+                    if let Some((offset, old_len, new_part)) =
+                        find_diff_anchored(doc_text, &dom_data, local_caret)
+                    {
                         found = Some((doc_pos + offset, old_len, new_part, node.clone()));
                     }
                 }
@@ -1033,6 +1047,61 @@ fn try_patch(document: &Document, old: &ViewDesc, new: &Node) -> Option<ViewDesc
             })
         }
     }
+}
+
+/// Like [`find_diff`], but disambiguated by the browser's own CURRENT
+/// caret offset within `b` (`caret_in_b`, in chars), when one is known
+/// and usable. Plain prefix/suffix string diffing is provably ambiguous
+/// whenever the inserted text shares characters with its own immediate
+/// neighborhood: e.g. `a = "typlain paragraph"`, `b = "typplain
+/// paragraph"` (typing a `"p"` right after `"ty"`, next to `a`'s own
+/// EXISTING `"p"` two characters later) is equally valid as "insert p
+/// at 2" or "insert p at 3" — both produce the IDENTICAL resulting
+/// text, but only "insert p at 2" matches where the caret actually is.
+/// Confirmed live (not assumed): the unanchored `find_diff` always
+/// resolves this kind of ambiguity by greedily extending the common
+/// PREFIX as far as string equality allows, which happens to pick the
+/// later, wrong position here — silently leaving the model's own
+/// notion of the caret one position behind after every such keystroke,
+/// compounding into a visibly scrambled word after a few
+/// (`"typed"` re-rendering as `"tyedp"`).
+///
+/// The browser's own caret, for a plain (non-IME, non-autocomplete)
+/// typed insertion, always sits exactly at the END of what was just
+/// inserted — so when the text grew (`b` longer than `a`) and a caret
+/// position is known, the edit's END in `b` is pinned to that caret
+/// DIRECTLY, rather than guessed at via string matching; the edit's
+/// START then follows immediately from the already-known length delta.
+/// The guess is still verified against both strings before being
+/// trusted (never applied blindly): falls straight through to the
+/// unanchored `find_diff` whenever the text didn't grow, no caret is
+/// available, or the anchored guess doesn't actually reconcile the two
+/// strings (composition commits, paste, and spellcheck/autocomplete
+/// replacing a whole word while the caret sits elsewhere are exactly
+/// the shapes this guards against misfiring on).
+fn find_diff_anchored(
+    a: &str,
+    b: &str,
+    caret_in_b: Option<usize>,
+) -> Option<(usize, usize, String)> {
+    if let Some(caret) = caret_in_b {
+        let a_chars: Vec<char> = a.chars().collect();
+        let b_chars: Vec<char> = b.chars().collect();
+        let (a_len, b_len) = (a_chars.len(), b_chars.len());
+        if b_len > a_len && caret <= b_len {
+            let inserted = b_len - a_len;
+            if caret >= inserted {
+                let old_start = caret - inserted;
+                let prefix_ok = a_chars[..old_start] == b_chars[..old_start];
+                let suffix_ok = a_chars[old_start..] == b_chars[caret..];
+                if prefix_ok && suffix_ok {
+                    let new_part: String = b_chars[old_start..caret].iter().collect();
+                    return Some((old_start, 0, new_part));
+                }
+            }
+        }
+    }
+    find_diff(a, b)
 }
 
 fn find_diff(a: &str, b: &str) -> Option<(usize, usize, String)> {
