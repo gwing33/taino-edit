@@ -443,7 +443,7 @@ fn wire_events(
         for kind in ["mousedown", "mousemove", "mouseup"] {
             let cb = Closure::<dyn FnMut(web_sys::Event)>::new(move |ev: web_sys::Event| {
                 if let Some(Some(action)) = with_view(runtime, |v| v.handle_view_event(&ev)) {
-                    apply_view_action(state, action);
+                    apply_view_action(state, runtime, action);
                 }
             });
             register(kind, cb);
@@ -518,27 +518,55 @@ fn apply_transform(state: RwSignal<EditorState>, tr: &Transform) {
     });
 }
 
-/// Apply a [`ViewAction`] produced by a view plugin to the state signal.
-fn apply_view_action(state: RwSignal<EditorState>, action: ViewAction) {
-    match action {
+/// Apply a [`ViewAction`] produced by a view plugin to the state signal
+/// AND, synchronously, to the live view/DOM — not just the reactive
+/// signal. A real, confirmed-live race, fixed here rather than left to
+/// the reactive `Effect` in `TainoEditor`'s own body (which ALSO
+/// eventually pushes `state`'s selection into the DOM, but only as an
+/// async microtask): a pointer-driven correction (e.g. a `ViewPlugin`
+/// fixing up a `mouseup` that landed the browser's own native caret
+/// somewhere wrong) could be outrun by the very next synchronous
+/// keystroke, which would then act against the DOM's still-STALE caret
+/// position for one more character before the async effect caught up —
+/// reproduced directly: typing immediately after such a correction
+/// landed each subsequent character progressively one position further
+/// behind, visibly scrambling the typed word. Mirrors EXACTLY what the
+/// `keydown` handler already does for its own `next: Option<EditorState>`
+/// (see `wire_events`) — this closes the same gap for pointer-driven
+/// corrections too.
+fn apply_view_action(
+    state: RwSignal<EditorState>,
+    runtime: StoredValue<Option<EditorRuntime>, LocalStorage>,
+    action: ViewAction,
+) {
+    let snapshot = state.get_untracked();
+    let next = match action {
         ViewAction::Select(sel) => {
-            state.update(|s| {
-                let mut tx = s.tr();
-                tx.set_selection(sel);
-                tx.no_history();
-                *s = s.apply(tx);
-            });
+            let mut tx = snapshot.tr();
+            tx.set_selection(sel);
+            tx.no_history();
+            snapshot.apply(tx)
         }
         ViewAction::Command(cmd) => {
-            let snapshot = state.get_untracked();
             let mut next = None;
             {
                 let mut d = |tx: Transaction| next = Some(snapshot.apply(tx));
                 cmd(&snapshot, Some(&mut d));
             }
-            if let Some(n) = next {
-                state.set(n);
-            }
+            let Some(n) = next else {
+                return;
+            };
+            n
         }
-    }
+    };
+    runtime.update_value(|rt| {
+        if let Some(r) = rt.as_mut() {
+            r.view.update(next.doc().clone());
+            r.applying_selection.set(true);
+            let _ = r.view.set_selection(next.selection());
+            r.applying_selection.set(false);
+            r.view.refresh_view_decorations(Some(next.selection()));
+        }
+    });
+    state.set(next);
 }
