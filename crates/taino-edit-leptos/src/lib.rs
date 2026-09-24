@@ -225,6 +225,47 @@ impl Drop for EventCloser {
     }
 }
 
+/// Whether `state`'s current selection is entirely "inside" an atom node
+/// (`NodeType::is_atom`) in either of the two shapes that can mean that: a
+/// real `Selection::Node` on an atom, or a non-empty `Selection::Text`
+/// range that exactly brackets one whole atom (the shape a `Node`
+/// selection decays into after a live DOM round-trip — see `wire_events`'s
+/// own keydown handler), or an EMPTY caret whose immediate parent is an
+/// atom (a bare caret that ended up one level inside an atom's own
+/// content, which should never be freely typable either). Fork-local
+/// addition: no adapter here previously used `NodeType::is_atom` at all,
+/// so nothing stopped ordinary typed-character keys (not just structural
+/// ones) from reaching native contenteditable handling while an atom was
+/// selected/trapped — letting Chrome's own "replace selected/typed-into
+/// content" behavior run over it, which for a node with a real DOM
+/// subtree (not a leaf) can produce genuinely corrupt markup neither this
+/// library nor any consumer's `read_dom_changes` has tracked meaning for.
+/// Used by `wire_events`'s keydown handler to treat ANY key the same way
+/// it already treats `"Enter"`/`"Backspace"`/`"Delete"`: always call
+/// `prevent_default()`, regardless of whether a bound keymap command
+/// happened to claim this particular key.
+fn selection_touches_an_atom(state: &EditorState) -> bool {
+    let doc = state.doc();
+    match state.selection() {
+        Selection::Node { pos } => doc
+            .node_at(pos)
+            .map(|n| n.node_type().is_atom())
+            .unwrap_or(false),
+        Selection::Text { anchor, head } if anchor != head => {
+            let (from, to) = (anchor.min(head), anchor.max(head));
+            doc.node_at(from)
+                .map(|n| n.node_type().is_atom() && from + n.node_size() == to)
+                .unwrap_or(false)
+        }
+        Selection::Text { anchor, .. } => ResolvedPos::resolve(doc, anchor)
+            .ok()
+            .is_some_and(|rp| rp.depth() > 0 && rp.parent().node_type().is_atom()),
+        // A table-cell range selection or a whole-document select-all is
+        // never "one whole atom" by definition — neither case applies here.
+        Selection::Cell { .. } | Selection::All => false,
+    }
+}
+
 /// Attach the standard event listeners on `el`.
 fn wire_events(
     el: &web_sys::Element,
@@ -332,8 +373,15 @@ fn wire_events(
                 state.set(n);
             }
             // Structural keys are model-authoritative: never let native
-            // contenteditable handling mutate the document.
-            let structural = matches!(key.key.as_str(), "Enter" | "Backspace" | "Delete");
+            // contenteditable handling mutate the document. An atom that's
+            // currently selected/trapped (`selection_touches_an_atom`) is
+            // ALSO always structural, regardless of which key was pressed
+            // — an atom is meant to be a genuinely opaque unit, so no typed
+            // character should ever reach native contenteditable handling
+            // while one is selected, the same way Backspace/Delete already
+            // never do.
+            let structural = matches!(key.key.as_str(), "Enter" | "Backspace" | "Delete")
+                || selection_touches_an_atom(&cur);
             if handled || structural {
                 kev.prevent_default();
             }
